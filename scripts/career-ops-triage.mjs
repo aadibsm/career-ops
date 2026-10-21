@@ -26,7 +26,7 @@ const args = process.argv.slice(2);
 const LIMIT = Number(argVal('--limit') || 40);
 const BATCH = Number(argVal('--batch') || 5);
 const DRY = args.includes('--dry-run');
-const CALL_TIMEOUT_MS = 150_000;
+const CALL_TIMEOUT_MS = Number(process.env.CAREER_OPS_TRIAGE_TIMEOUT_MS || 240_000);
 
 function argVal(flag) {
   const i = args.indexOf(flag);
@@ -90,7 +90,20 @@ async function fetchJd(url) {
     }
   }
 
-  // Generic: og:description meta tag (Ashby, ICIMS, most SPA pages)
+  // Ashby (public posting API — full plain-text JD)
+  m = url.match(/jobs\.ashbyhq\.com\/([a-z0-9-]+)\/([a-z0-9-]+)/i);
+  if (m) {
+    const j = await tryFetch(`https://api.ashbyhq.com/posting-api/job-board/${m[1]}?includeDescription=true`, { Accept: 'application/json' });
+    if (j) {
+      try {
+        const o = JSON.parse(j);
+        const job = (o.jobs || []).find(x => x.id === m[2] || x.jobUrl === url);
+        if (job) return { title: job.title, body: strip(job.descriptionPlain || job.descriptionHtml || ''), location: job.location || '' };
+      } catch { /* fall through */ }
+    }
+  }
+
+  // Generic: og:description meta tag (ICIMS, most SPA pages)
   const html = await tryFetch(url);
   if (html) {
     const og = html.match(/property="og:description" content="([^"]{0,1200})/i);
@@ -122,6 +135,13 @@ ${jobBlock}`;
   });
   if (r.status !== 0 || !r.stdout) return null;
   return r.stdout.split('\n').map(l => l.trim()).filter(l => /TRIAGE:|PASS|MARGINAL|FAIL|SKIP/.test(l) && l.includes('|'));
+}
+
+// One retry on a failed batch call — transient gateway/model hiccups are common.
+function triageBatchWithRetry(jobs, brief) {
+  let v = triageBatch(jobs, brief);
+  if (!v) v = triageBatch(jobs, brief);
+  return v;
 }
 
 // Robust parse: verdict keyword anywhere in the first cells, score anywhere.
@@ -173,26 +193,29 @@ for (let i = 0; i < rows.length; i += BATCH) {
       if (!jd) j.jd = ''; // SKIP verdict below
     } catch { j.jd = ''; }
   }
-  const verdicts = triageBatch(batch, brief);
+  const verdicts = triageBatchWithRetry(batch, brief);
   const ts = new Date().toISOString();
   for (let k = 0; k < batch.length; k++) {
     const j = batch[k];
     let verdict, score, reason;
     if (!j.jd) {
       verdict = 'SKIP'; score = '0.0'; reason = 'JD inaccessible — posting likely expired';
-    } else if (verdicts && verdicts[k]) {
-      const parsed = parseVerdict(verdicts[k]);
+    } else if (!verdicts) {
+      // Transient failure: do NOT record — the row stays in the queue for the next run.
+      console.log(`RETRY | ${j.company} | ${j.role} | triage call failed, will retry next run`);
+      continue;
+    } else {
+      const line = verdicts[k] || '';
+      const parsed = parseVerdict(line);
       if (parsed) {
         verdict = parsed.verdict; score = parsed.score; reason = parsed.reason;
       } else {
         // Model omitted the keyword — infer verdict from the score.
-        const sm = verdicts[k].match(/(\d\.\d)\/5/);
+        const sm = line.match(/(\d\.\d)\/5/);
         score = sm ? sm[1] : '0.0';
         verdict = score >= '3.5' ? 'PASS' : score >= '3.0' ? 'MARGINAL' : 'FAIL';
-        reason = verdicts[k].split('|').slice(3).join(' | ') || 'no reason given';
+        reason = line.split('|').slice(3).join(' | ') || 'no reason given';
       }
-    } else {
-      verdict = 'SKIP'; score = '0.0'; reason = 'triage call failed';
     }
     if (verdict === 'PASS') pass++; else if (verdict === 'MARGINAL') marginal++; else if (verdict === 'FAIL') fail++; else skip++;
     scored++;
