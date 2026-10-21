@@ -281,3 +281,4 @@ data/interview-prep/
 .next/
 web/.next/
 web/out/
+reports/sweep-report-*.txt
